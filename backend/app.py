@@ -61,7 +61,8 @@ Examples: “What’s 14 times 13 again?” → “182.”
 def transcribe_file(path: str) -> str:
     with open(path, "rb") as f:
         resp = oa_client.audio.transcriptions.create(
-            model="gpt-4o-mini-transcribe",
+            model="whisper-1",
+            #gpt-4o-mini-transcribe
             file=f,
             response_format="text",
             language="en",
