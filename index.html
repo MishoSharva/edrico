@@ -1,0 +1,341 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Edrico</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="icon" type="image/png" href="edricologo.png">
+  <style>
+    body{margin:0;font-family:system-ui,Arial;background:#fff;color:#111}
+    header,main{max-width:780px;margin:0 auto;padding:12px 16px}
+    button{padding:10px 14px;border:0;border-radius:1px;background:#111827;color:#fff;cursor:pointer}
+    button[disabled]{opacity:.6;cursor:not-allowed}
+    .muted{color:#6b7280;font-size:14px}
+    .item{border:1px solid #e6ebf2;border-radius:10px;padding:10px;margin-top:10px;display:flex;flex-direction:column;gap:8px}
+    .row{display:flex;align-items:center;gap:10px}
+    pre{background:#f6f8fa;padding:8px;border-radius:6px;overflow:auto}
+    .tx{font-size:14px;line-height:1.4;border-left:3px solid #e6ebf2;padding-left:8px;white-space:pre-wrap}
+    .label{font-size:12px;color:#6b7280;margin-top:4px}
+  </style>
+</head>
+<body>
+<header>
+  <button id="startBtn">Start mic</button>
+  <button id="saveBtn" disabled>Save last 20s</button>
+  <span id="state" class="muted">idle</span>
+</header>
+<main>
+  <div class="muted">Permission: <span id="perm">unknown</span> | Context secure: <span id="secure"></span> | Origin: <span id="origin"></span></div>
+  <h3>Log</h3>
+  <pre id="log"></pre>
+  <div id="clips"></div>
+</main>
+
+<script>
+  const TARGET_SECONDS = 20; //was 16
+  const EXTRA_MARGIN_SECONDS = 0.35;  //tail flush margin
+  const BACKEND = (location.port === "5000" || location.hostname === "127.0.0.1" || location.hostname === "localhost")
+    ? "http://127.0.0.1:5000"
+    : location.origin;
+
+  const startBtn = document.getElementById('startBtn');
+  const saveBtn  = document.getElementById('saveBtn');
+  const stateEl  = document.getElementById('state');
+  const clipsEl  = document.getElementById('clips');
+  const permEl   = document.getElementById('perm');
+  const secureEl = document.getElementById('secure');
+  const originEl = document.getElementById('origin');
+  const logEl    = document.getElementById('log');
+
+  let stream=null, ac=null, src=null, workletNode=null, spNode=null;
+  let ring=null, ringWrite=0, ringLen=0, sampleRate=48000;
+
+  function log(s){ logEl.textContent += s+"\n"; logEl.scrollTop = logEl.scrollHeight; }
+  function setState(s){ stateEl.textContent = s; log(s); }
+
+  function makeRing(seconds, sr){
+    ringLen = Math.ceil((seconds + 1) * sr); //+1s headroom
+    ring = new Float32Array(ringLen);
+    ringWrite = 0;
+  }
+
+  function writeToRing(input){
+    const n = input.length;
+    if (!n) return;
+    const end = ringWrite + n;
+    if (end <= ringLen){
+      ring.set(input, ringWrite);
+    } else {
+      const first = ringLen - ringWrite;
+      ring.set(input.subarray(0, first), ringWrite);
+      ring.set(input.subarray(first), 0);
+    }
+    ringWrite = (ringWrite + n) % ringLen;
+  }
+
+  function readLastSeconds(seconds){
+    const n = Math.min(ringLen, Math.floor(seconds*sampleRate));
+    const out = new Float32Array(n);
+    const start = (ringWrite - n + ringLen) % ringLen;
+    if (start + n <= ringLen){
+      out.set(ring.subarray(start, start+n), 0);
+    } else {
+      const first = ringLen - start;
+      out.set(ring.subarray(start), 0);
+      out.set(ring.subarray(0, n-first), first);
+    }
+    return out;
+  }
+
+  function resampleMono(float32, fromRate, toRate) {
+    if (toRate === fromRate) return float32;
+    const ratio = fromRate / toRate;
+    const newLen = Math.floor(float32.length / ratio);
+    const out = new Float32Array(newLen);
+    for (let i = 0; i < newLen; i++) {
+      const idx = i * ratio;
+      const i0 = Math.floor(idx);
+      const i1 = Math.min(i0 + 1, float32.length - 1);
+      const t = idx - i0;
+      out[i] = float32[i0] * (1 - t) + float32[i1] * t;
+    }
+    return out;
+  }
+
+  function encodeWavFromFloat(float32, sr, targetSr = 16000){
+    const mono = resampleMono(float32, sr, targetSr);
+    const numSamples = mono.length;
+    const bytesPerSample = 2;
+    const numChannels = 1;
+    const blockAlign = numChannels * bytesPerSample;
+    const byteRate = targetSr * blockAlign;
+    const dataSize = numSamples * blockAlign;
+    const buffer = new ArrayBuffer(44 + dataSize);
+    const view = new DataView(buffer);
+
+    function writeString(offset, str){ for (let i=0;i<str.length;i++) view.setUint8(offset+i, str.charCodeAt(i)); }
+
+    writeString(0, 'RIFF');
+    view.setUint32(4, 36 + dataSize, true);
+    writeString(8, 'WAVE');
+    writeString(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, numChannels, true);
+    view.setUint32(24, targetSr, true);
+    view.setUint32(28, byteRate, true);
+    view.setUint16(32, blockAlign, true);
+    view.setUint16(34, bytesPerSample*8, true);
+    writeString(36, 'data');
+    view.setUint32(40, dataSize, true);
+
+    let offset = 44;
+    for (let i=0;i<numSamples;i++){
+      let s = Math.max(-1, Math.min(1, mono[i]));
+      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      offset += 2;
+    }
+    return new Blob([buffer], { type: 'audio/wav' });
+  }
+
+  async function ensureMic(){
+    if (stream) return stream;
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio:{ echoCancellation:true, noiseSuppression:true },
+      video:false
+    });
+    permEl.textContent = 'granted';
+    return stream;
+  }
+
+  async function setupAudio(){
+    ac = new (window.AudioContext || window.webkitAudioContext)();
+    sampleRate = ac.sampleRate || 48000;
+    makeRing(TARGET_SECONDS + 6, sampleRate); //was +5
+    src = ac.createMediaStreamSource(stream);
+
+    try{
+      const code = `
+        class RBProcessor extends AudioWorkletProcessor {
+          process(inputs){
+            const input = inputs[0];
+            if (input && input.length){
+              const chs = input.length;
+              const N = input[0].length;
+              const mono = new Float32Array(N);
+              for (let i=0;i<N;i++){
+                let s = 0;
+                for (let c=0;c<chs;c++) s += input[c][i] || 0;
+                mono[i] = s / chs;
+              }
+              this.port.postMessage(mono, [mono.buffer]);
+            }
+            return true;
+          }
+        }
+        registerProcessor('rbp', RBProcessor);
+      `;
+      const workletUrl = URL.createObjectURL(new Blob([code], {type:'application/javascript'}));
+      await ac.audioWorklet.addModule(workletUrl);
+      workletNode = new AudioWorkletNode(ac, 'rbp', { numberOfInputs:1, numberOfOutputs:0 });
+      workletNode.port.onmessage = (e)=> writeToRing(new Float32Array(e.data));
+      src.connect(workletNode);
+    }catch{
+      const inCh = src.channelCount || 1;
+      spNode = ac.createScriptProcessor(2048, inCh, 1);
+      spNode.onaudioprocess = (e)=>{
+        const nCh = e.inputBuffer.numberOfChannels || 1;
+        const N = e.inputBuffer.length;
+        const mono = new Float32Array(N);
+        for (let i=0;i<N;i++){
+          let s = 0;
+          for (let c=0;c<nCh;c++) s += e.inputBuffer.getChannelData(c)[i] || 0;
+          mono[i] = s / nCh;
+        }
+        writeToRing(mono);
+      };
+      const g = ac.createGain(); g.gain.value = 0.0;
+      src.connect(spNode); spNode.connect(g).connect(ac.destination);
+    }
+
+    const resume = () => ac && ac.state !== 'running' && ac.resume().catch(()=>{});
+    window.addEventListener('click', resume, {passive:true});
+    window.addEventListener('keydown', resume, {passive:true});
+    resume();
+  }
+
+  async function init(){
+    try{
+      originEl.textContent = location.origin;
+      secureEl.textContent = (location.protocol==='https:' || location.hostname==='127.0.0.1' || location.hostname==='localhost') ? 'yes' : 'no';
+      setState('requesting mic…');
+      await ensureMic();
+      await setupAudio();
+      saveBtn.disabled = false;
+      setState('listening');
+    }catch(err){
+      setState('mic error: ' + (err?.message || err));
+      saveBtn.disabled = true;
+    }
+  }
+
+  function addClip(localUrl, serverUrl, mt, transcript){
+    const wrap = document.createElement('div');
+    wrap.className = 'item';
+
+    const row = document.createElement('div');
+    row.className = 'row';
+
+    const audio = document.createElement('audio');
+    audio.controls = true;
+    audio.src = localUrl;
+    audio.preload = 'metadata';
+
+    const fname = `edrico-${new Date().toISOString().replace(/[:.]/g,'-')}.wav`;
+
+    const a = document.createElement('a');
+    a.href = serverUrl || localUrl;
+    a.download = fname;
+    a.textContent = 'Download';
+
+    const s = document.createElement('span');
+    s.className='muted';
+    s.textContent = mt || '';
+
+    row.append(audio, a, s);
+
+    const txLabel = document.createElement('div');
+    txLabel.className = 'label';
+    txLabel.textContent = 'Transcript';
+
+    const tx = document.createElement('div');
+    tx.className = 'tx';
+    tx.textContent = transcript && transcript.trim().length ? transcript : 'Transcribing…';
+
+    const axLabel = document.createElement('div');
+    axLabel.className = 'label';
+    axLabel.textContent = 'AI answer';
+
+    const ax = document.createElement('div');
+    ax.className = 'tx';
+    ax.textContent = 'Thinking…';
+
+    wrap.append(row, txLabel, tx, axLabel, ax);
+    clipsEl.prepend(wrap);
+
+    return { transcriptEl: tx, answerEl: ax, wrap };
+  }
+
+  async function postJSON(url, obj){
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(obj)
+    });
+    const txt = await res.text();
+    let data={}; try{ data = JSON.parse(txt);}catch{}
+    return { ok: res.ok, status: res.status, data, raw: txt };
+  }
+
+  async function saveToBackend(){
+    try{
+      setState('finishing capture…');
+      await new Promise(r => setTimeout(r, 250));
+      if (ac && ac.state !== 'running') { try { await ac.resume(); } catch {} }
+
+      setState('encoding wav…');
+      const last = readLastSeconds(TARGET_SECONDS + EXTRA_MARGIN_SECONDS); 
+      if (!last.length){ setState('no audio captured yet'); return; }
+
+      const blob = encodeWavFromFloat(last, sampleRate, 16000);
+      const localUrl = URL.createObjectURL(blob);
+      const nodes = addClip(localUrl, '', blob.type, '');
+
+      setState('uploading for transcription…');
+      const fd = new FormData();
+      fd.append('audio', blob, 'last20s.wav');
+
+      const trRes = await fetch(BACKEND + '/transcribe', { method:'POST', body: fd });
+      const trTxt = await trRes.text();
+      let trData={}; try{ trData = JSON.parse(trTxt);}catch{}
+
+      if (trRes.ok && trData?.ok){
+        nodes.transcriptEl.textContent = (trData.transcript || '').trim() || '(no speech detected)';
+
+        const serverUrl = BACKEND + trData.url;
+        const lastItem = clipsEl.firstElementChild;
+        const link = lastItem.querySelector('a');
+        link.href = serverUrl;
+
+        setState('transcribed; asking AI…');
+        const ask = await postJSON(BACKEND + '/ask', { text: trData.transcript || '' });
+
+        if (ask.ok && ask.data?.ok){
+          nodes.answerEl.textContent = (ask.data.assistant_reply || '').trim() || '(no reply)';
+          if (ask.data.tts && ask.data.tts.url){
+            const audioEl = new Audio(BACKEND + ask.data.tts.url);
+            audioEl.play().catch(()=>{});
+          }
+          setState('done');
+        } else {
+          const msg = (ask.data && (ask.data.error || ask.data.message)) ? (ask.data.error || ask.data.message) : ask.raw || 'assistant failed';
+          nodes.answerEl.textContent = msg;
+          setState(`assistant failed (${ask.status})`);
+        }
+      } else {
+        const msg = (trData && (trData.error || trData.message)) ? (trData.error || trData.message) : trTxt || 'Transcription failed';
+        nodes.transcriptEl.textContent = msg;
+        nodes.answerEl.textContent = '';
+        setState(`upload/transcribe failed (${trRes.status})`);
+      }
+    }catch(e){
+      setState('save error: ' + (e?.message || e));
+    }
+  }
+
+  startBtn.addEventListener('click', init);
+  saveBtn.addEventListener('click', saveToBackend);
+  document.addEventListener('keydown', e => { if (e.key === ' ') { e.preventDefault(); saveToBackend(); }});
+</script>
+</body>
+</html>
